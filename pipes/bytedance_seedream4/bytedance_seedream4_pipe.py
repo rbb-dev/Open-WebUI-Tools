@@ -66,7 +66,7 @@ class Pipe:
         )
         # Fallback defaults when task model is disabled/unavailable
         WATERMARK: bool = Field(
-            default=True,
+            default=False,
             description="Fallback: Add watermark when task model fails or is disabled.",
         )
         DEFAULT_SIZE: str = Field(
