@@ -85,6 +85,7 @@ class Pipe:
             "2K",
             "4K",
         }
+        self._supported_size_lookup = {size.lower(): size for size in self.supported_sizes}
         self._supported_dimension_pairs = [
             (1024, 1024),
             (2048, 2048),
@@ -217,40 +218,45 @@ class Pipe:
                     return str(value[key])
         return str(value) if value is not None else ""
 
+    def _consume_sse_line(self, raw_line: str, content_parts: List[str]) -> None:
+        """Parse a single SSE data line and append its content if valid."""
+        line = (raw_line or "").strip()
+        if not line or line == "data: [DONE]":
+            return
+        payload = line[5:].strip() if line.startswith("data:") else line
+        if not payload:
+            return
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return
+        for choice in data.get("choices", []):
+            delta = choice.get("delta") or choice.get("message")
+            if not delta:
+                continue
+            content_value = delta.get("content") if isinstance(delta, dict) else delta
+            piece = self._normalise_model_content(content_value)
+            if piece:
+                content_parts.append(piece)
+
     async def _read_model_response_content(self, response: Any) -> str:
         """Normalise streaming or non-streaming task model responses to text."""
         if hasattr(response, "body_iterator"):
             content_parts: List[str] = []
+            buffer = ""
             async for chunk in response.body_iterator:
                 if not chunk:
                     continue
                 try:
                     chunk_str = chunk.decode("utf-8")
                 except Exception:
-                    continue
-                # Assume OpenAI-style SSE where each line is 'data: {json}' or '[DONE]'.
-                for raw_line in chunk_str.splitlines():
-                    line = raw_line.strip()
-                    if not line or line == "data: [DONE]":
-                        continue
-                    if line.startswith("data:"):
-                        payload = line[5:].strip()
-                    else:
-                        payload = line
-                    if not payload:
-                        continue
-                    try:
-                        data = json.loads(payload)
-                    except json.JSONDecodeError:
-                        continue
-                    for choice in data.get("choices", []):
-                        delta = choice.get("delta") or choice.get("message")
-                        if not delta:
-                            continue
-                        content_value = delta.get("content") if isinstance(delta, dict) else delta
-                        piece = self._normalise_model_content(content_value)
-                        if piece:
-                            content_parts.append(piece)
+                    chunk_str = chunk.decode("utf-8", errors="ignore")
+                buffer += chunk_str
+                while "\n" in buffer:
+                    raw_line, buffer = buffer.split("\n", 1)
+                    self._consume_sse_line(raw_line, content_parts)
+            if buffer:
+                self._consume_sse_line(buffer, content_parts)
             return "".join(content_parts)
         if isinstance(response, dict):
             choices = response.get("choices") or []
@@ -304,10 +310,15 @@ class Pipe:
 
     def _validate_and_get_size(self, requested_size: str) -> str:
         """Validate requested size and return supported size or default."""
-        if requested_size in self.supported_sizes:
-            return requested_size
+        candidate = (requested_size or "").strip()
+        if not candidate:
+            return self.valves.DEFAULT_SIZE
+        dimension_normalized = candidate.replace("×", "x")
+        lookup_key = dimension_normalized.lower()
+        if lookup_key in self._supported_size_lookup:
+            return self._supported_size_lookup[lookup_key]
         # If not directly supported, try to find closest match
-        normalized = requested_size.lower().replace("×", "x")
+        normalized = dimension_normalized
         if "x" in normalized:
             try:
                 width_str, height_str = normalized.split("x", 1)
@@ -522,6 +533,14 @@ Respond ONLY with valid JSON:"""
             logger.error(f"Failed to load file {file_id}: {exc}")
             return None
 
+    async def _read_file_bytes(self, path: str) -> bytes:
+        """Read file contents without blocking the event loop."""
+        def _read() -> bytes:
+            with open(path, "rb") as f:
+                return f.read()
+
+        return await run_in_threadpool(_read)
+
     def _get_fallback_parameters(
         self,
         prompt: str = "",
@@ -705,7 +724,19 @@ Respond ONLY with valid JSON:"""
                         },
                         timeout=self.valves.REQUEST_TIMEOUT,
                     ) as client:
-                        logger.info(f"Request payload: {json.dumps(json_data, indent=2)}")
+                        redacted_payload = {
+                            "model": json_data.get("model"),
+                            "size": json_data.get("size"),
+                            "watermark": json_data.get("watermark"),
+                            "prompt_chars": len(json_data.get("prompt", "")),
+                        }
+                        if "image" in json_data:
+                            redacted_payload["image_count"] = (
+                                len(json_data["image"])
+                                if isinstance(json_data["image"], list)
+                                else 1
+                            )
+                        logger.info("Request payload summary: %s", redacted_payload)
                         response = await client.post(endpoint, json=json_data)
                         # Handle array fallback for older gateways
                         if response.status_code == 400 and isinstance(json_data.get("image"), list):
@@ -842,8 +873,7 @@ Respond ONLY with valid JSON:"""
                             file_item = await self._get_file_by_id(file_id)
                             if file_item and file_item.path:
                                 try:
-                                    with open(file_item.path, "rb") as f:
-                                        file_data = f.read()
+                                    file_data = await self._read_file_bytes(file_item.path)
                                 except Exception as exc:
                                     logger.error(f"Failed to read file {file_id} from disk: {exc}")
                                     continue
@@ -871,8 +901,7 @@ Respond ONLY with valid JSON:"""
                     file_item = await self._get_file_by_id(file_id)
                     if file_item and file_item.path:
                         try:
-                            with open(file_item.path, "rb") as f:
-                                file_data = f.read()
+                            file_data = await self._read_file_bytes(file_item.path)
                         except Exception as exc:
                             logger.error(f"Failed to read file {file_id} from disk: {exc}")
                             continue
