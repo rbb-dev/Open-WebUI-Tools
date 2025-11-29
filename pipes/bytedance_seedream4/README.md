@@ -29,6 +29,7 @@ Set valves via the Open WebUI plugin UI or by editing defaults in the file.
 - `API_BASE_URL` (string, default: `https://api.cometapi.com/v1`).
 - `ENABLE_LOGGING` (bool, default: `False`): when `True`, logs at INFO level; otherwise, only errors.
 - `MODEL` (string, default: `bytedance-seedream-4-0-250828`).
+- `GUIDANCE_SCALE` (int, default: `3`): guidance strength passed to CometAPI /images/generations (1–20, higher values hug the prompt more closely).
 - `TASK_MODEL_ENABLED` (bool, default: `True`): enable internal prompt analysis to set intent/size/watermark.
 - `WATERMARK` (bool, default: `True`): fallback watermark when task model is disabled or fails.
 - `DEFAULT_SIZE` (string, default: `2048x2048`).

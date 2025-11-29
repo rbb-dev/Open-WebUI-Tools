@@ -53,16 +53,20 @@ class Pipe:
         ENABLE_LOGGING: bool = Field(default=False, description="Enable info/debug logs for this plugin. When False, only errors are logged.")
         # Model and basic generation options
         MODEL: str = Field(default="bytedance-seedream-4-0-250828", description="Doubao Seedream 4.0 model id")
+        GUIDANCE_SCALE: int = Field(
+            default=3,
+            description="Default guidance scale (1-20). Larger values stay closer to the prompt per CometAPI docs.",
+        )
         # Task model settings
-        TASK_MODEL_ENABLED: bool = Field(default=True, description="Enable task model for dynamic parameter detection")
-        # Fallback defaults when task model is disabled/unavailable
-        WATERMARK: bool = Field(default=False, description="Fallback: Add watermark when task model fails or is disabled.")
+        TASK_MODEL: str = Field(default="gpt-4.1-mini", description="Task model id used when Open WebUI does not supply one.")
+        # Defaults when task model output is missing optional fields
+        WATERMARK: bool = Field(default=False, description="Default watermark preference when task model omits the field.")
         DEFAULT_SIZE: str = Field(default="2048x2048", description="Default image size when not specified or unsupported size requested.")
         # HTTP client
         REQUEST_TIMEOUT: int = Field(default=600, description="Request timeout in seconds")
-        TASK_MODEL_FALLBACK: str = Field(default="gpt-4.1-mini", description="Fallback task model id when Open WebUI does not supply one.")
 
     def __init__(self):
+        """Configure valves, logging, and cached size metadata on instantiation."""
         self.valves = self.Valves()
         # Apply logging policy on startup
         self._apply_logging_valve()
@@ -86,19 +90,6 @@ class Pipe:
             "4K",
         }
         self._supported_size_lookup = {size.lower(): size for size in self.supported_sizes}
-        self._supported_dimension_pairs = [
-            (1024, 1024),
-            (2048, 2048),
-            (2304, 1728),
-            (1728, 2304),
-            (2560, 1440),
-            (1440, 2560),
-            (2496, 1664),
-            (1664, 2496),
-            (3024, 1296),
-            (4096, 4096),
-            (6240, 2656),
-        ]
 
     def _apply_logging_valve(self) -> None:
         """Set logger level based on ENABLE_LOGGING valve.
@@ -136,25 +127,58 @@ class Pipe:
             logger.error(f"Failed to extract image dimensions: {e}")
             return None, None
 
-    def _dimensions_to_size_param(self, width: int, height: int) -> str:
-        """Convert image dimensions to supported size parameter."""
-        size_str = f"{width}x{height}"
-        # Check if exact match exists
-        if size_str in self.supported_sizes:
-            return size_str
-        # Find closest supported size
-        min_diff = float("inf")
-        closest_size = self.valves.DEFAULT_SIZE
-        for sup_w, sup_h in self._supported_dimension_pairs:
-            # Calculate difference based on total pixel count and aspect ratio similarity
-            pixel_diff = abs((width * height) - (sup_w * sup_h))
-            aspect_diff = abs((width / height) - (sup_w / sup_h)) * 1000  # Weight aspect ratio
-            total_diff = pixel_diff + aspect_diff
-            if total_diff < min_diff:
-                min_diff = total_diff
-                closest_size = f"{sup_w}x{sup_h}"
-        logger.info(f"Mapped {width}x{height} to closest supported size: {closest_size}")
-        return closest_size
+    @staticmethod
+    def _estimate_base64_size_bytes(image_data: str) -> Optional[int]:
+        """Approximate decoded byte size of a base64 string without allocating memory."""
+        if not image_data:
+            return None
+        try:
+            length = len(image_data.strip())
+        except Exception:
+            return None
+        if not length:
+            return None
+        return (length * 3) // 4
+
+    @staticmethod
+    def _strip_image_placeholders(text: str) -> str:
+        """Remove placeholder tokens like [image:2] from prompts before sending to API."""
+        if not text:
+            return ""
+        return re.sub(r"\[image:\d+\]", "", text).strip()
+
+    def _build_reference_image_context(
+        self,
+        images: List[Dict[str, Any]],
+        conversation: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Compile detailed metadata for every provided reference image."""
+        if not images:
+            return None
+        mention_lookup: Dict[int, List[int]] = {}
+        if conversation:
+            for entry in conversation:
+                for idx in entry.get("image_refs", []):
+                    mention_lookup.setdefault(idx, []).append(entry.get("message_index", -1))
+        details: List[Dict[str, Any]] = []
+        for idx, image in enumerate(images):
+            width, height = self._get_image_dimensions(image.get("data", ""))
+            approx_bytes = self._estimate_base64_size_bytes(image.get("data", ""))
+            detail = {
+                "index": idx,
+                "mime_type": (image.get("mimeType") or "").lower(),
+                "origin": image.get("origin"),
+                "width": width,
+                "height": height,
+                "size_label": f"{width}x{height}" if width and height else None,
+                "approx_bytes": approx_bytes,
+                "approx_megapixels": round((width * height) / 1_000_000, 3)
+                if width and height
+                else None,
+                "mentioned_in": mention_lookup.get(idx, []),
+            }
+            details.append(detail)
+        return {"count": len(images), "details": details}
 
     def _extract_first_json_object(self, text: str) -> Optional[str]:
         """Extract the first balanced JSON object found inside arbitrary text.
@@ -268,128 +292,94 @@ class Pipe:
                     return self._normalise_model_content(content_value)
         return str(response or "")
 
-    def _extract_size_from_prompt(self, prompt: str) -> str:
-        """Extract size information from natural language input."""
-        prompt_lower = prompt.lower()
-        # Check for exact dimension patterns
-        dimension_patterns = [
-            r"(\d{3,4})\s*[x×]\s*(\d{3,4})",  # 1024x1024, 2048×2048
-            r"(\d{3,4})\s*by\s*(\d{3,4})",  # 1024 by 1024
-            r"(\d{3,4})\s*×\s*(\d{3,4})",  # 1024 × 1024
-        ]
-        for pattern in dimension_patterns:
-            match = re.search(pattern, prompt_lower)
-            if match:
-                width, height = int(match.group(1)), int(match.group(2))
-                size_str = f"{width}x{height}"
-                if size_str in self.supported_sizes:
-                    return size_str
-        # Check for resolution shorthand
-        if "4k" in prompt_lower or "4096" in prompt_lower:
-            return "4K"
-        elif "2k" in prompt_lower or "2048" in prompt_lower:
-            return "2K"
-        elif "1k" in prompt_lower or "1024" in prompt_lower:
-            return "1K"
-        # Check for aspect ratio descriptions
-        aspect_ratio_map = {
-            ("square", "1:1"): "2048x2048",
-            ("4:3", "4 by 3"): "2304x1728",
-            ("3:4", "3 by 4", "portrait"): "1728x2304",
-            ("16:9", "widescreen", "landscape"): "2560x1440",
-            ("9:16", "vertical", "phone screen"): "1440x2560",
-            ("3:2",): "2496x1664",
-            ("2:3",): "1664x2496",
-            ("21:9", "ultrawide"): "3024x1296",
-        }
-        for keywords, size in aspect_ratio_map.items():
-            if any(keyword in prompt_lower for keyword in keywords):
-                return size
-        # Default size
-        return self.valves.DEFAULT_SIZE
-
-    def _validate_and_get_size(self, requested_size: str) -> str:
-        """Validate requested size and return supported size or default."""
-        candidate = (requested_size or "").strip()
-        if not candidate:
-            return self.valves.DEFAULT_SIZE
-        dimension_normalized = candidate.replace("×", "x")
-        lookup_key = dimension_normalized.lower()
-        if lookup_key in self._supported_size_lookup:
-            return self._supported_size_lookup[lookup_key]
-        # If not directly supported, try to find closest match
-        normalized = dimension_normalized
-        if "x" in normalized:
-            try:
-                width_str, height_str = normalized.split("x", 1)
-                width, height = int(width_str.strip()), int(height_str.strip())
-                if width > 0 and height > 0:
-                    return self._dimensions_to_size_param(width, height)
-            except ValueError:
-                pass
-        return self.valves.DEFAULT_SIZE
-
     async def _analyse_prompt_with_task_model(
         self,
-        prompt: str,
-        has_images: bool,
-        original_image_size: Optional[str],
+        conversation: List[Dict[str, Any]],
+        image_context: Optional[Dict[str, Any]],
+        raw_user_prompt: str,
         __user__: dict,
         body: dict,
         user_obj: Optional[UserModel],
         __request__: Request,
         emitter: Optional[Callable[[dict], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
-        """Use task model to determine optimal generation parameters."""
-        if not self.valves.TASK_MODEL_ENABLED:
-            return self._get_fallback_parameters(prompt, original_image_size, has_images)
-        # Build analysis prompt based on whether we're editing or generating
-        if has_images and original_image_size:
-            analysis_prompt = f"""Analyse this image editing prompt and determine optimal parameters:
-Prompt: "{prompt}"
-Has reference images: {has_images}
-Original image size: {original_image_size}
-Rules for parameter determination:
-1. **intent**: Determine if user wants to generate new image or edit existing one
-   - "generate" for: new image requests, create, make, draw, produce, show me, another
-   - "edit" for: modify, change, alter, adjust, fix, recolor, add, remove, replace
-   - If has_images=True and user wants modifications: "edit"
-   - If has_images=True but user wants new/different image: "generate"
-2. **watermark**: 
-   - false for professional/artistic/commercial use (headshots, logos, artwork, professional photos)
-   - true for casual/social media/meme content
-3. **size**: For IMAGE EDITING, preserve original size UNLESS user explicitly requests resize
-   - If editing and NO resize mentioned: return original_image_size ({original_image_size})
-   - If editing and resize requested: extract new size from prompt
-   - Supported sizes: 1024x1024, 2048x2048, 2304x1728, 1728x2304, 2560x1440, 1440x2560, 2496x1664, 1664x2496, 3024x1296, 4096x4096, 6240x2656, 1K, 2K, 4K
-   - Look for resize keywords: "resize", "make it", "change size", "bigger", "smaller", specific dimensions
-Examples for editing:
-- "remove the tyre on the bottom left" → {{"intent": "edit", "watermark": true, "size": "{original_image_size}"}}
-- "change the bird to red" → {{"intent": "edit", "watermark": true, "size": "{original_image_size}"}}
-- "resize this to 1024x1024 and remove the car" → {{"intent": "edit", "watermark": true, "size": "1024x1024"}}
-- "make this image smaller and change the color" → {{"intent": "edit", "watermark": true, "size": "1024x1024"}}
-Respond ONLY with valid JSON:"""
-        else:
-            analysis_prompt = f"""Analyse this image generation prompt and determine optimal parameters:
-Prompt: "{prompt}"
-Has reference images: {has_images}
-Rules for parameter determination:
-1. **intent**: Determine if user wants to generate new image or edit existing one
-   - "generate" for: new image requests, create, make, draw, produce, show me, another
-   - "edit" for: modify, change, alter, adjust, fix, recolor, add, remove, replace
-2. **watermark**: 
-   - false for professional/artistic/commercial use (headshots, logos, artwork, professional photos)
-   - true for casual/social media/meme content
-3. **size**: Extract size from natural language, choose from supported values:
-   - Exact dimensions: 1024x1024, 2048x2048, 2304x1728, 1728x2304, 2560x1440, 1440x2560, 2496x1664, 1664x2496, 3024x1296, 4096x4096, 6240x2656
-   - Resolution shorthand: 1K, 2K, 4K
-   - Common mappings: square/1:1→2048x2048, 4:3→2304x1728, 3:4/portrait→1728x2304, 16:9/widescreen→2560x1440, 9:16/vertical→1440x2560, 21:9/ultrawide→3024x1296
-   - Default: 2048x2048 if no size specified
-Examples:
-- "make a Melbourne skyline in 4K" → {{"intent": "generate", "watermark": true, "size": "4K"}}
-- "professional headshot 16:9" → {{"intent": "generate", "watermark": false, "size": "2560x1440"}}
-- "create square logo 1024x1024" → {{"intent": "generate", "watermark": false, "size": "1024x1024"}}
-Respond ONLY with valid JSON:"""
+        """Delegate all decision making to the configured task model."""
+        supported_sizes = sorted(self.supported_sizes)
+        sizes_list = ", ".join(supported_sizes)
+        system_prompt = f"""
+You are the orchestration task model for ByteDance Seedream 4.0 image generation and editing. The payload you receive has:
+- `conversation`: ordered chat history entries (`message_index`, `role`, `text`, `image_refs`). `text` already strips inline image markdown and uses placeholders like `[image:2]` when an attachment is referenced.
+- `raw_user_prompt`: the latest user-written text extracted before post-processing (may still contain noise; prefer `conversation` for context).
+- `defaults`: fallback values (size, watermark) when the user does not specify them.
+- `reference_images.details`: zero or more reference images with `index`, `origin`, `mime_type`, `width`, `height`, `size_label`, `approx_bytes`, and `approx_megapixels`.
+
+Processing checklist BEFORE you answer:
+1. Read the full prompt and infer the real goal (new render vs tweak/edit vs variation).
+2. Inspect every reference image entry. Note which ones are usable, their sizes, and whether they already match the allowed Seedream sizes.
+3. Decide how each image contributes (base, style, mask, ignore) and whether any per-image resizing is needed.
+4. Determine the final output size, making sure it is one of the supported sizes ({sizes_list}).
+5. Decide watermark, resize behaviour, and craft short explanations for the UI.
+
+Always respond with ONLY JSON (no markdown). First, interpret everything the user asked for (including synonyms such as "remix", "tweak", "draw", "make another", etc.). Then map that understanding onto the canonical fields below. The response MUST match this schema and explain every decision:
+{{
+  "prompt": string,                        // clean natural-language prompt to send to the API (no placeholders like [image:2])
+  "intent": "generate" | "edit",          // is the user asking for a new render or editing references?
+  "watermark": boolean,                     // true = add watermark, false = no watermark
+  "size": string,                           // one of: {sizes_list}
+  "resize_target": {{"width": int, "height": int}} | null,  // desired final width/height when user explicitly asks to resize
+  "use_reference_images": boolean,          // true only if at least one image is actively used
+  "image_plan": [
+    {{
+      "index": int,                         // index from reference_images.details
+      "action": "use" | "ignore",         // whether the downstream pipeline should include this image
+      "role": "base" | "reference" | "style" | "mask", // describe how the image is used
+      "target_size": string | null          // per-image resize from {sizes_list} when that image is off-spec
+    }}
+  ],
+  "status_message": string,                // <=120 chars, short sentence describing what will happen (shown to user)
+  "notes": string                          // <=120 chars, internal reasoning or highlights (not shown to model output)
+}}
+
+- `prompt`: REQUIRED. Write the exact text we should send to the downstream API. Use clear natural language, mention the desired scene/edit explicitly, and NEVER include placeholder tokens like `[image:2]` or other markup—describe the images instead (e.g., “Use the second uploaded photo…”). Keep it concise but complete.
+- `intent`: Analyse verbs and nouns first, without assuming specific keywords. Requests that derive a new artwork, variation, or fresh concept should map to `generate`. Requests that modify, fix, repaint, or otherwise transform provided references should map to `edit` (provided at least one usable image exists). When wording is ambiguous, choose the option that best matches the overall goal and explain the decision in `notes`.
+- `watermark`: Professional/commercial/portfolio/headshot/logo work → false. Casual, meme, playful, or social media content → true. When unsure, apply the defaults and justify in `notes`.
+- `size` (FINAL OUTPUT):
+    1. The downstream API accepts ONLY the supported sizes listed above. Every final request must use one of them.
+    2. Parse any dimension/ratio/"k" wording from the prompt. If the user specifies something unsupported, map it to the closest allowed size by balancing aspect ratio and pixel count.
+    3. When editing, prefer the primary reference image’s size if it already matches a supported option; otherwise map it to the nearest supported size and mention the mapping in `notes`.
+    4. Document any trade-offs (e.g., “user asked for 2500×1500 so mapped to 2560×1440”).
+- `resize_target` (FINAL OUTPUT DIMENSIONS): Populate only when the user explicitly requests a different final size/resolution. Use integer values that correspond to the chosen `size`. Leave null when editing without resize instructions and the chosen `size` already matches the reference.
+- `image_plan` (PER-IMAGE ACTIONS):
+    • Provide one entry for every image in `reference_images.details`, even if ignored. Use `conversation[].image_refs` (which mirror placeholders like `[image:3]`) to understand how each image was mentioned.
+    • `action`: `use` when the image participates in the edit/generation, otherwise `ignore`.
+    • `role` guidelines: `base` = primary image being edited, `reference` = additional visual guidance, `style` = style/lighting reference, `mask` = mask/cutout.
+    • `target_size`: REQUIRED whenever that image’s native width/height does not exactly match an allowed size. Choose the closest supported size (same metric as `size`) so the pipeline knows to resize before sending to the API. Omit/leave null only when the image already matches an allowed size or when the image is ignored.
+    • If multiple images conflict (very different ratios), select a best compromise: use the most important image (usually the base) to decide the final `size`, then resize the others via their `target_size`. Explain trade-offs in `notes`.
+- `use_reference_images`: Set to true if and only if at least one `image_plan` entry has `action":"use"`. Otherwise set to false.
+- `status_message`: A concise sentence (<=120 chars) summarising the plan for the UI, e.g., “Editing base image #0, resize to 4K, no watermark”. Mention intent, selected images, and final size when possible.
+- `notes`: Mention crucial reasoning—size mappings, ignored images, ambiguity resolutions, safety concerns. Keep it <=120 chars and combine with `status_message` to stay under 200 chars total.
+
+General rules:
+- When multiple reference images are supplied, ensure the plan is internally consistent (e.g., only one base image, masks only when user implied masking, etc.).
+- Respect safety hints (skip unsupported formats or missing metadata, note it in `notes`).
+- Never invent metadata that is not present. Base your decisions solely on the provided prompt, defaults, and reference image details.
+- The output MUST be pure JSON with the exact keys described. No code fences, no backticks, no prose outside the JSON.
+"""
+
+        has_images = bool((image_context or {}).get("count", 0))
+
+        task_payload = {
+            "raw_user_prompt": raw_user_prompt,
+            "conversation": conversation,
+            "has_reference_images": has_images,
+            "reference_images": image_context or {"count": 0, "details": []},
+            "supported_sizes": supported_sizes,
+            "defaults": {
+                "size": self.valves.DEFAULT_SIZE,
+                "watermark": self.valves.WATERMARK,
+            },
+        }
+
         try:
             task_model = self._resolve_task_model(body, user_obj, __request__)
             await self.emit_status("Analysing prompt...", emitter=emitter)
@@ -397,64 +387,173 @@ Respond ONLY with valid JSON:"""
             if not resolved_user:
                 logger.error("Unable to resolve user for task model call")
                 raise RuntimeError("user_lookup_failed")
-            # Structure the request body properly
+
             form_data = {
                 "model": task_model,
-                "messages": [{"role": "user", "content": analysis_prompt}],
-                "max_tokens": 150,
+                "messages": [
+                    {"role": "system", "content": system_prompt.strip()},
+                    {"role": "user", "content": json.dumps(task_payload, ensure_ascii=True)},
+                ],
+                "max_tokens": 200,
                 "temperature": 0.1,
                 "stream": False,
             }
-            # Make the internal call with proper objects
+            logger.info("Task model request payload: %s", json.dumps(form_data, ensure_ascii=False))
+
             response = await generate_chat_completions(
                 form_data=form_data,
                 user=resolved_user,
                 request=__request__,
             )
             content = await self._read_model_response_content(response)
-            if content:
-                # Extract JSON from response
-                json_blob = self._extract_first_json_object(content)
-                if json_blob:
-                    try:
-                        params = json.loads(json_blob)
-                        if not isinstance(params, dict):
-                            logger.error("Task model JSON root is not an object")
-                        else:
-                            validated_params = self._validate_task_model_params(params, prompt, original_image_size)
-                            logger.info(f"Task model determined parameters: {validated_params}")
-                            return validated_params
-                    except json.JSONDecodeError as e:
-                        logger.error(f"Failed to parse JSON from task model: {e}")
-                else:
-                    logger.error("Task model response did not contain valid JSON")
-                    logger.debug(f"Task model response snippet: {content[:1000]}")
-            else:
-                logger.error("Task model returned empty response")
-        except Exception as e:
-            logger.error(f"Task model call failed: {e}")
+            logger.info("Task model raw response: %s", content)
+            if not content:
+                raise RuntimeError("task_model_empty_response")
+
+            json_blob = self._extract_first_json_object(content)
+            if not json_blob:
+                logger.debug(f"Task model raw response: {content[:1000]}")
+                raise RuntimeError("task_model_missing_json")
+
+            params = json.loads(json_blob)
+            if not isinstance(params, dict):
+                raise RuntimeError("task_model_invalid_schema")
+
+            image_count = (image_context or {}).get("count", 0)
+            validated_params = self._validate_task_model_params(
+                params,
+                image_count,
+                fallback_prompt=raw_user_prompt or "",
+            )
+            logger.info(f"Task model determined parameters: {validated_params}")
+            return validated_params
+        except Exception as exc:
+            logger.error(f"Task model call failed: {exc}")
             import traceback
 
             logger.debug(f"Full traceback: {traceback.format_exc()}")
-        # Fallback to valve defaults
-        logger.info("Task model failed, using fallback analysis")
-        return self._get_fallback_parameters(prompt, original_image_size, has_images)
+            raise
+
+    def _validate_size_choice(self, value: Any) -> str:
+        """Ensure the supplied size string matches supported entries."""
+        normalized = str(value or "").replace("×", "x").strip().lower()
+        if not normalized:
+            raise ValueError("Empty size value from task model")
+        if normalized not in self._supported_size_lookup:
+            raise ValueError(f"Unsupported size requested by task model: {value}")
+        return self._supported_size_lookup[normalized]
+
+    def _coerce_guidance_scale(self, value: Any) -> int:
+        """Parse guidance scale from request/body and clamp to sane defaults."""
+        default = getattr(self.valves, "GUIDANCE_SCALE", 3)
+        if value is None:
+            return default
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(1, min(parsed, 20))
+
+    @staticmethod
+    def _coerce_image_count(value: Any) -> int:
+        """Parse desired output count (`n`) and keep it within API limits."""
+        if value is None:
+            return 1
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return 1
+        # CometAPI constraint: references + generated images <= 15.
+        return max(1, min(parsed, 10))
 
     def _validate_task_model_params(
-        self, params: Dict[str, Any], prompt: str, original_image_size: Optional[str]
+        self,
+        params: Dict[str, Any],
+        image_count: int,
+        fallback_prompt: str,
     ) -> Dict[str, Any]:
-        """Validate and sanitise parameters from task model."""
-        validated = {}
-        # intent
-        intent = params.get("intent", "generate")
-        validated["intent"] = intent if intent in ["generate", "edit"] else "generate"
-        # watermark
-        watermark = params.get("watermark", True)
-        validated["watermark"] = bool(watermark)
-        # size - validate against supported sizes
-        requested_size = params.get("size", original_image_size or self.valves.DEFAULT_SIZE)
-        validated["size"] = self._validate_and_get_size(str(requested_size))
-        return validated
+        """Validate and sanitise parameters coming back from the task model."""
+        prompt_value = params.get("prompt")
+        if not isinstance(prompt_value, str) or not prompt_value.strip():
+            prompt_text = self._strip_image_placeholders(fallback_prompt)
+            logger.warning("Task model response missing 'prompt'; falling back to user prompt")
+        else:
+            prompt_text = self._strip_image_placeholders(prompt_value)
+
+        intent_raw = str(params.get("intent", "generate")).lower()
+        intent = intent_raw if intent_raw in {"generate", "edit"} else "generate"
+
+        size = self._validate_size_choice(params.get("size", self.valves.DEFAULT_SIZE))
+
+        watermark = bool(params.get("watermark", self.valves.WATERMARK))
+        use_reference_images = bool(params.get("use_reference_images", False))
+        if image_count <= 0:
+            use_reference_images = False
+
+        resize_target = params.get("resize_target")
+        validated_resize: Optional[Dict[str, int]] = None
+        if isinstance(resize_target, dict):
+            width = resize_target.get("width")
+            height = resize_target.get("height")
+            if isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0:
+                validated_resize = {"width": width, "height": height}
+
+        notes = params.get("notes")
+        notes_str = notes.strip() if isinstance(notes, str) else ""
+
+        image_plan_entries: List[Dict[str, Any]] = []
+        raw_plan = params.get("image_plan") or []
+        if isinstance(raw_plan, list) and image_count > 0:
+            for entry in raw_plan:
+                if not isinstance(entry, dict):
+                    continue
+                index = entry.get("index")
+                if not isinstance(index, int) or index < 0 or index >= image_count:
+                    continue
+                action = str(entry.get("action", "ignore")).lower()
+                if action not in {"use", "ignore"}:
+                    action = "ignore"
+                role = str(entry.get("role", "reference")).lower()
+                if role not in {"base", "reference", "style", "mask"}:
+                    role = "reference"
+                target_size = entry.get("target_size")
+                validated_target_size = None
+                if target_size:
+                    try:
+                        validated_target_size = self._validate_size_choice(target_size)
+                    except ValueError:
+                        validated_target_size = None
+                image_plan_entries.append(
+                    {
+                        "index": index,
+                        "action": action,
+                        "role": role,
+                        "target_size": validated_target_size,
+                    }
+                )
+
+        use_reference_images = use_reference_images or any(
+            entry.get("action") == "use" for entry in image_plan_entries
+        )
+
+        if intent == "edit" and not use_reference_images:
+            logger.info("Task model intent was 'edit' without usable reference images; switching to 'generate'.")
+            intent = "generate"
+
+        status_message = params.get("status_message")
+        status_message = status_message.strip() if isinstance(status_message, str) else ""
+
+        return {
+            "prompt": prompt_text,
+            "intent": intent,
+            "watermark": watermark,
+            "size": size,
+            "use_reference_images": use_reference_images,
+            "resize_target": validated_resize,
+            "notes": notes_str,
+            "image_plan": image_plan_entries,
+            "status_message": status_message,
+        }
 
     def _resolve_task_model(
         self,
@@ -465,6 +564,7 @@ Respond ONLY with valid JSON:"""
         """Resolve which task model to call using Open WebUI preferences."""
 
         def _extract(source: Any) -> Optional[str]:
+            """Normalise candidate objects and pull out the first task-model identifier."""
             mapping = self._object_to_mapping(source)
             for key in (
                 "task_model",
@@ -500,10 +600,11 @@ Respond ONLY with valid JSON:"""
         if candidate:
             return candidate
 
-        return self.valves.TASK_MODEL_FALLBACK
+        return self.valves.TASK_MODEL
 
     @staticmethod
     def _object_to_mapping(source: Any) -> Dict[str, Any]:
+        """Convert arbitrary objects (dicts, Pydantic models, namespaces) into a mapping."""
         if not source:
             return {}
         if isinstance(source, dict):
@@ -518,6 +619,7 @@ Respond ONLY with valid JSON:"""
         return getattr(source, "__dict__", {}) or {}
 
     async def _get_user_by_id(self, user_id: str) -> Optional[UserModel]:
+        """Fetch a user record without blocking the async loop."""
         try:
             return await run_in_threadpool(Users.get_user_by_id, user_id)
         except Exception as exc:
@@ -525,6 +627,7 @@ Respond ONLY with valid JSON:"""
             return None
 
     async def _get_file_by_id(self, file_id: str):
+        """Look up file metadata via the ORM in a threadpool."""
         try:
             from open_webui.models.files import Files
 
@@ -535,75 +638,16 @@ Respond ONLY with valid JSON:"""
 
     async def _read_file_bytes(self, path: str) -> bytes:
         """Read file contents without blocking the event loop."""
+
         def _read() -> bytes:
+            """Blocking helper invoked inside run_in_threadpool."""
             with open(path, "rb") as f:
                 return f.read()
 
         return await run_in_threadpool(_read)
 
-    def _get_fallback_parameters(
-        self,
-        prompt: str = "",
-        original_image_size: Optional[str] = None,
-        has_images: bool = False,
-    ) -> Dict[str, Any]:
-        """Get fallback parameters from valves and prompt analysis."""
-        # For editing, preserve original size unless explicitly requesting resize
-        if original_image_size and not self._prompt_requests_resize(prompt):
-            size = original_image_size
-        else:
-            # Extract size from prompt for generation or explicit resize
-            extracted_size = self._extract_size_from_prompt(prompt) if prompt else self.valves.DEFAULT_SIZE
-            size = self._validate_and_get_size(extracted_size)
-        intent = "edit" if (original_image_size or has_images) else "generate"
-        return {
-            "intent": intent,
-            "watermark": self.valves.WATERMARK,
-            "size": size,
-        }
-
-    def _prompt_requests_resize(self, prompt: str) -> bool:
-        """Check if prompt explicitly requests resizing."""
-        prompt_lower = prompt.lower()
-        dimension_patterns = [
-            r"\d{3,4}\s*[x×]\s*\d{3,4}",
-            r"\d{3,4}\s*by\s*\d{3,4}",
-        ]
-        for pattern in dimension_patterns:
-            if re.search(pattern, prompt_lower):
-                return True
-        intent_keywords = [
-            "resize",
-            "rescale",
-            "scale",
-            "change size",
-            "adjust size",
-            "make it",
-            "make larger",
-            "make smaller",
-            "set",
-            "increase",
-            "decrease",
-            "bigger",
-            "smaller",
-            "larger",
-            "reduce",
-        ]
-        size_indicators = [
-            "resolution",
-            "dimensions",
-            "dimension",
-            "aspect ratio",
-            "ratio",
-            "size",
-        ]
-        numeric_indicators = ["1k", "2k", "4k", "1024", "2048", "4096"]
-        has_intent = any(keyword in prompt_lower for keyword in intent_keywords)
-        has_size_keyword = any(keyword in prompt_lower for keyword in size_indicators)
-        has_numeric_hint = any(token in prompt_lower for token in numeric_indicators)
-        return has_intent and (has_size_keyword or has_numeric_hint)
-
     async def pipes(self) -> List[dict]:
+        """Return the manifest entry consumed by Open WebUI."""
         return [{"id": "seedream-4-0", "name": "ByteDance: Seedream 4.0"}]
 
     async def pipe(
@@ -613,11 +657,13 @@ Respond ONLY with valid JSON:"""
         __request__: Request,
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
     ) -> StreamingResponse:
+        """Main entrypoint invoked by Open WebUI for each generation/edit request."""
         # Re-apply in case valves changed at runtime
         self._apply_logging_valve()
         user = await self._get_user_by_id(__user__["id"])
 
         async def stream_response():
+            """Yield OpenAI-compatible response chunks (streaming or single payload)."""
             try:
                 model = self.valves.MODEL
                 messages = body.get("messages", [])
@@ -631,8 +677,8 @@ Respond ONLY with valid JSON:"""
                     if is_stream:
                         yield "data: [DONE]\n\n"
                     return
-                # Extract prompt and images
-                prompt, images = await self._extract_prompt_and_images(messages)
+                # Extract structured conversation and images
+                conversation_log, images, last_user_text = await self._collect_conversation_and_images(messages)
                 if not self.valves.API_KEY:
                     yield self._format_data(
                         is_stream=is_stream,
@@ -642,48 +688,79 @@ Respond ONLY with valid JSON:"""
                     if is_stream:
                         yield "data: [DONE]\n\n"
                     return
-                # Get original image size for editing
-                original_image_size = None
+                # Build reference metadata for task model
+                image_context: Optional[Dict[str, Any]] = None
                 if images:
-                    await self.emit_status("Detecting original image dimensions...", emitter=__event_emitter__)
-                    first_image = images[0]
-                    width, height = self._get_image_dimensions(
-                        first_image.get("data", "")
-                    )
-                    if width and height:
-                        original_image_size = self._dimensions_to_size_param(width, height)
-                        logger.info(f"Original image dimensions: {width}x{height} -> {original_image_size}")
+                    await self.emit_status("Analyzing reference image metadata...", emitter=__event_emitter__)
+                    image_context = self._build_reference_image_context(images, conversation_log)
+                    if image_context:
+                        summary = ", ".join(
+                            f"#{detail['index']}:{detail.get('size_label') or 'unknown'}"
+                            for detail in image_context.get("details", [])
+                        )
+                        logger.info(
+                            "Reference images detected (%s total): %s",
+                            image_context.get("count", 0),
+                            summary,
+                        )
                 # Get dynamic parameters from task model
                 dynamic_params = await self._analyse_prompt_with_task_model(
-                    prompt,
-                    bool(images),
-                    original_image_size,
+                    conversation_log,
+                    image_context,
+                    last_user_text,
                     __user__,
                     body,
                     user,
                     __request__,
                     emitter=__event_emitter__,
                 )
+                resolved_prompt = dynamic_params.get("prompt") or last_user_text or ""
+                resolved_prompt = self._strip_image_placeholders(resolved_prompt)
+                if not resolved_prompt:
+                    raise RuntimeError("Task model did not return a prompt")
                 # Build request JSON using dynamic parameters
                 endpoint = "/images/generations"
                 json_data: Dict[str, Any] = {
                     "model": model,
-                    "prompt": prompt,
+                    "prompt": resolved_prompt,
                     "response_format": "b64_json",
                     "watermark": dynamic_params["watermark"],
                     "size": dynamic_params["size"],
+                    "guidance_scale": self._coerce_guidance_scale(body.get("guidance_scale")),
+                    "n": self._coerce_image_count(body.get("n") or body.get("num_images")),
                 }
-                # Handle intent and images
-                if dynamic_params["intent"] == "edit" and not images:
-                    logger.info("Task model suggested edit but no images provided, treating as generate")
-                elif dynamic_params["intent"] == "generate" and images:
-                    logger.info("Task model suggested generate despite images present, ignoring images for new generation")
-                    images = []  # Clear images for new generation
+                task_notes = dynamic_params.get("notes") or ""
+                if task_notes:
+                    logger.info(f"Task model notes: {task_notes}")
+
+                image_plan = dynamic_params.get("image_plan", [])
+                selected_images: List[Dict[str, str]] = []
+                selected_indices: List[int] = []
+                if image_plan:
+                    logger.info("Task model image plan: %s", image_plan)
+                    for directive in image_plan:
+                        if directive.get("action") != "use":
+                            continue
+                        idx = directive.get("index")
+                        if isinstance(idx, int) and 0 <= idx < len(images):
+                            selected_indices.append(idx)
+                            selected_images.append(images[idx])
+                elif dynamic_params.get("use_reference_images"):
+                    selected_indices = list(range(len(images)))
+                    selected_images = images[:]
+
+                if dynamic_params["intent"] == "edit" and not selected_images:
+                    logger.info(
+                        "Task model intent 'edit' but no usable reference images selected; falling back to generation mode."
+                    )
+
+                is_edit_request = dynamic_params["intent"] == "edit" and bool(selected_images)
+
                 # Prepare images for editing
                 image_uris: List[str] = []
-                if images and dynamic_params["intent"] == "edit":
+                if is_edit_request:
                     await self.emit_status("Preparing image editing...", emitter=__event_emitter__)
-                    for im in images:
+                    for im in selected_images:
                         mime = (im.get("mimeType") or "").lower().strip()
                         if mime not in ("image/png", "image/jpeg", "image/jpg"):
                             continue
@@ -692,27 +769,32 @@ Respond ONLY with valid JSON:"""
                         b64 = im.get("data", "")
                         if not b64:
                             continue
-                        # Size check (optional)
-                        try:
-                            if (len(b64) * 3) // 4 > 10 * 1024 * 1024:
-                                logger.info("Skipping image >10MB after decode estimate")
-                                continue
-                        except Exception:
-                            pass
+                        approx_size = self._estimate_base64_size_bytes(b64)
+                        if approx_size and approx_size > 10 * 1024 * 1024:
+                            logger.info("Skipping image >10MB after decode estimate")
+                            continue
                         image_uris.append(f"data:{mime};base64,{b64}")
                     if image_uris:
                         if len(image_uris) == 1:
                             json_data["image"] = image_uris[0]
                         else:
                             json_data["image"] = image_uris[:10]
-                # Show size preservation info in status
-                size_info = f"size: {dynamic_params['size']}"
-                if original_image_size and dynamic_params["size"] == original_image_size:
-                    size_info += " (preserved)"
-                elif original_image_size and dynamic_params["size"] != original_image_size:
-                    size_info += f" (resized from {original_image_size})"
-                params_info = f"({dynamic_params['intent']}, {size_info}, watermark: {dynamic_params['watermark']})"
-                status_message = f"Editing image {params_info}..." if image_uris else f"Generating image {params_info}..."
+
+                resize_target = dynamic_params.get("resize_target")
+                resize_info = ""
+                if resize_target:
+                    resize_info = f", resize_to: {resize_target.get('width')}x{resize_target.get('height')}"
+                params_info = (
+                    f"(intent: {dynamic_params['intent']}, size: {dynamic_params['size']}, "
+                    f"images used: {len(selected_images)}/{len(images)}, watermark: {dynamic_params['watermark']}{resize_info})"
+                )
+                status_message = dynamic_params.get("status_message")
+                if status_message:
+                    status_message = status_message.strip()
+                if not status_message:
+                    status_message = (
+                        f"Editing image {params_info}..." if is_edit_request else f"Generating image {params_info}..."
+                    )
                 await self.emit_status(status_message, emitter=__event_emitter__)
                 # Make API request
                 try:
@@ -728,7 +810,9 @@ Respond ONLY with valid JSON:"""
                             "model": json_data.get("model"),
                             "size": json_data.get("size"),
                             "watermark": json_data.get("watermark"),
-                            "prompt_chars": len(json_data.get("prompt", "")),
+                            "prompt": json_data.get("prompt"),
+                            "guidance_scale": json_data.get("guidance_scale"),
+                            "n": json_data.get("n"),
                         }
                         if "image" in json_data:
                             redacted_payload["image_count"] = (
@@ -736,7 +820,15 @@ Respond ONLY with valid JSON:"""
                                 if isinstance(json_data["image"], list)
                                 else 1
                             )
-                        logger.info("Request payload summary: %s", redacted_payload)
+                            redacted_payload["image"] = "<omitted base64>"
+                        logger.info(
+                            "Request payload summary: prompt=%s | size=%s | watermark=%s | images=%s",
+                            redacted_payload.get("prompt"),
+                            redacted_payload.get("size"),
+                            redacted_payload.get("watermark"),
+                            redacted_payload.get("image_count", 0),
+                        )
+                        logger.info("Request payload detail: %s", redacted_payload)
                         response = await client.post(endpoint, json=json_data)
                         # Handle array fallback for older gateways
                         if response.status_code == 400 and isinstance(json_data.get("image"), list):
@@ -831,105 +923,142 @@ Respond ONLY with valid JSON:"""
         media_type = "text/event-stream" if body.get("stream", False) else "application/json"
         return StreamingResponse(stream_response(), media_type=media_type)
 
-    async def _extract_prompt_and_images(
+    async def _collect_conversation_and_images(
         self, messages: List[Dict[str, Any]]
-    ) -> tuple[str, List[Dict[str, str]]]:
-        """Extract prompt and image data from messages."""
-        prompt = ""
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, str]], str]:
+        """Capture the conversation text plus every referenced image."""
+
+        conversation: List[Dict[str, Any]] = []
         images: List[Dict[str, str]] = []
-        # Take prompt from the most recent user message
-        for message in reversed(messages):
-            if message.get("role") != "user":
-                continue
+        last_user_text = ""
+
+        data_uri_pattern = re.compile(r"!\[[^\]]*\]\(data:([^;]+);base64,([^)]+)\)")
+        file_pattern = re.compile(r"!\[[^\]]*\]\((/api/v1/files/[^)]+|/files/[^)]+)\)")
+        remote_pattern = re.compile(r"!\[[^\]]*\]\((https?://[^)]+)\)")
+
+        def _append_image_record(mime_type: str, data: str, origin: Dict[str, Any]) -> int:
+            idx = len(images)
+            images.append({"mimeType": mime_type, "data": data, "origin": origin})
+            return idx
+
+        async def _append_file_image(file_id: str) -> Optional[int]:
+            file_item = await self._get_file_by_id(file_id)
+            if file_item and file_item.path:
+                try:
+                    file_data = await self._read_file_bytes(file_item.path)
+                except Exception as exc:
+                    logger.error(f"Failed to read file {file_id} from disk: {exc}")
+                    return None
+                data = base64.b64encode(file_data).decode("utf-8")
+                meta = (file_item.meta or {})
+                mime_type = meta.get("content_type", "image/png")
+                return _append_image_record(mime_type, data, {"type": "file", "id": file_id})
+            logger.error(f"Failed to fetch file {file_id}: not found")
+            return None
+
+        async def _append_remote_image(url: str) -> Optional[int]:
+            remote_image = await self._fetch_remote_image(url)
+            if not remote_image:
+                return None
+            idx = len(images)
+            images.append(remote_image)
+            return idx
+
+        async def _ingest_url_source(url: str) -> Optional[int]:
+            if not url:
+                return None
+            url = url.strip()
+            if url.startswith("data:"):
+                parts = url.split(";base64,", 1)
+                if len(parts) == 2:
+                    mime_type = parts[0].replace("data:", "", 1).lower()
+                    data = parts[1]
+                    return _append_image_record(mime_type, data, {"type": "data_uri"})
+                return None
+            if "/api/v1/files/" in url or "/files/" in url:
+                file_id = (
+                    url.split("/api/v1/files/")[-1].split("/")[0].split("?")[0]
+                    if "/api/v1/files/" in url
+                    else url.split("/files/")[-1].split("/")[0].split("?")[0]
+                )
+                return await _append_file_image(file_id)
+            return await _append_remote_image(url)
+
+        for message_index, message in enumerate(messages):
+            role = message.get("role", "user")
             content = message.get("content", "")
+            text_segments: List[str] = []
+            image_refs: List[int] = []
+
+            def _register_placeholder(idx: Optional[int]) -> str:
+                if idx is None:
+                    return ""
+                image_refs.append(idx)
+                return f"[image:{idx}]"
+
             if isinstance(content, list):
                 for item in content:
                     if item.get("type") == "text":
-                        prompt += item.get("text", "") + " "
+                        text_segments.append(item.get("text", ""))
+                    elif item.get("type") == "image_url":
+                        idx = await _ingest_url_source(item.get("image_url", {}).get("url", ""))
+                        placeholder = _register_placeholder(idx)
+                        if placeholder:
+                            text_segments.append(placeholder)
             elif isinstance(content, str):
-                prompt = content
-            break
-        prompt = prompt.strip()
-        # Gather images from the last message (user or assistant) that contains images
-        for message in reversed(messages):
-            role = message.get("role", "")
-            if role not in ["user", "assistant"]:
-                continue
-            content = message.get("content", "")
-            if isinstance(content, list):
-                for item in content:
-                    if item.get("type") == "image_url":
-                        url = item.get("image_url", {}).get("url", "")
-                        if not url:
-                            continue
-                        if url.startswith("data:"):
-                            parts = url.split(";base64,", 1)
-                            if len(parts) == 2:
-                                mime_type = parts[0].replace("data:", "", 1).lower()
-                                data = parts[1]
-                                images.append({"mimeType": mime_type, "data": data})
-                        elif "/api/v1/files/" in url or "/files/" in url:
-                            file_id = url.split("/api/v1/files/")[-1].split("/")[0].split("?")[0] if "/api/v1/files/" in url else url.split("/files/")[-1].split("/")[0].split("?")[0]
-                            file_item = await self._get_file_by_id(file_id)
-                            if file_item and file_item.path:
-                                try:
-                                    file_data = await self._read_file_bytes(file_item.path)
-                                except Exception as exc:
-                                    logger.error(f"Failed to read file {file_id} from disk: {exc}")
-                                    continue
-                                data = base64.b64encode(file_data).decode("utf-8")
-                                meta = (file_item.meta or {})
-                                mime_type = meta.get("content_type", "image/png")
-                                images.append({"mimeType": mime_type, "data": data})
-                            else:
-                                logger.error(f"Failed to fetch file {file_id}: not found")
-                        else:
-                            remote_image = await self._fetch_remote_image(url)
-                            if remote_image:
-                                images.append(remote_image)
-            elif isinstance(content, str):
-                # Inline data URI markdown
-                for mime_type, data in re.findall(
-                    r"!\[[^\]]*\]\(data:([^;]+);base64,([^)]+)\)", content
-                ):
-                    images.append({"mimeType": mime_type.lower(), "data": data})
-                # File reference markdown
-                for file_url in re.findall(
-                    r"!\[[^\]]*\]\((/api/v1/files/[^)]+|/files/[^)]+)\)", content
-                ):
-                    file_id = file_url.split("/api/v1/files/")[-1].split("/")[0].split("?")[0] if "/api/v1/files/" in file_url else file_url.split("/files/")[-1].split("/")[0].split("?")[0]
-                    file_item = await self._get_file_by_id(file_id)
-                    if file_item and file_item.path:
-                        try:
-                            file_data = await self._read_file_bytes(file_item.path)
-                        except Exception as exc:
-                            logger.error(f"Failed to read file {file_id} from disk: {exc}")
-                            continue
-                        data = base64.b64encode(file_data).decode("utf-8")
-                        meta = (file_item.meta or {})
-                        mime_type = meta.get("content_type", "image/png")
-                        images.append({"mimeType": mime_type, "data": data})
-                    else:
-                        logger.error(f"Failed to fetch file {file_id}: not found")
-                # Remote image markdown
-                for remote_url in re.findall(
-                    r"!\[[^\]]*\]\((https?://[^)]+)\)", content
-                ):
-                    remote_image = await self._fetch_remote_image(remote_url)
-                    if remote_image:
-                        images.append(remote_image)
-            if images:
-                break
-        # Clean prompt of image markdown
-        if images and isinstance(prompt, str):
-            prompt = re.sub(
-                r"!\[[^\]]*\]\(data:[^;]+;base64,[^)]+\)", "", prompt
-            ).strip()
-            prompt = re.sub(
-                r"!\[[^\]]*\]\((/api/v1/files/[^)]+|/files/[^)]+)\)", "", prompt
-            ).strip()
-        logger.info(f"Extracted prompt: '{prompt[:100]}...', found {len(images)} image(s)")
-        return prompt, images
+                text_value = content
+
+                while True:
+                    match = data_uri_pattern.search(text_value)
+                    if not match:
+                        break
+                    mime_type = match.group(1).lower()
+                    data = match.group(2)
+                    idx = _append_image_record(mime_type, data, {"type": "data_uri"})
+                    placeholder = _register_placeholder(idx)
+                    text_value = text_value[: match.start()] + placeholder + text_value[match.end():]
+
+                while True:
+                    match = file_pattern.search(text_value)
+                    if not match:
+                        break
+                    file_url = match.group(1)
+                    file_id = (
+                        file_url.split("/api/v1/files/")[-1].split("/")[0].split("?")[0]
+                        if "/api/v1/files/" in file_url
+                        else file_url.split("/files/")[-1].split("/")[0].split("?")[0]
+                    )
+                    idx = await _append_file_image(file_id)
+                    placeholder = _register_placeholder(idx)
+                    text_value = text_value[: match.start()] + placeholder + text_value[match.end():]
+
+                while True:
+                    match = remote_pattern.search(text_value)
+                    if not match:
+                        break
+                    remote_url = match.group(1)
+                    idx = await _append_remote_image(remote_url)
+                    placeholder = _register_placeholder(idx)
+                    replacement = placeholder or ""
+                    text_value = text_value[: match.start()] + replacement + text_value[match.end():]
+
+                text_segments.append(text_value.strip())
+            else:
+                text_segments.append("")
+
+            cleaned_text = " ".join(segment for segment in text_segments if segment).strip()
+            conversation.append(
+                {
+                    "message_index": message_index,
+                    "role": role,
+                    "text": cleaned_text,
+                    "image_refs": image_refs,
+                }
+            )
+            if role == "user" and cleaned_text:
+                last_user_text = cleaned_text
+
+        return conversation, images, last_user_text
 
     async def _fetch_remote_image(self, url: str) -> Optional[Dict[str, str]]:
         """Download remote image URLs when provided by the client."""
@@ -953,11 +1082,12 @@ Respond ONLY with valid JSON:"""
             logger.error(f"Remote image {url} exceeds 10MB decoded size. Skipping.")
             return None
         data = base64.b64encode(response.content).decode("utf-8")
-        return {"mimeType": mime_type, "data": data}
+        return {"mimeType": mime_type, "data": data, "origin": {"type": "url", "value": url}}
 
     async def _upload_image(
         self, __request__: Request, user: UserModel, image_data: str, mime_type: str
     ) -> str:
+        """Upload generated image bytes to the WebUI file store and return its URL."""
         try:
             file_item = await run_in_threadpool(
                 upload_file,
